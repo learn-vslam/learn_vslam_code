@@ -20,8 +20,6 @@
 #include "backend.hpp"
 #include "utils.hpp"
 
-namespace fs = std::filesystem;
-
 class MonoVO 
 {
 public:
@@ -68,7 +66,7 @@ public:
         if (config.load_gt_pose)
             gt_pose = loader.load_gt_pose();
 
-        fs::create_directories(config.result_dir);
+        std::filesystem::create_directories(config.result_dir);
         out_pose_file = config.result_dir + "/" + "traj_est.txt";
         out_pose_ba_file = config.result_dir + "/" + "traj_est_ba.txt";
         out_ply_file  = config.result_dir + "/" + "pcd.ply";
@@ -77,6 +75,10 @@ public:
         std::cout << "MonoVO initialized " << std::endl;
         std::cout << "num of frames: " << num_frames << std::endl;
         
+        // Sync config to frontend instances
+        tracking.config = config;
+        mapping.config = config;
+
         // Initialize loop detector
         loop_detector = LoopDetector(K);
     }
@@ -296,6 +298,8 @@ public:
             prev_T_wc = curr_T_wc;
         }
 
+        // call backend optimization after all frames are tracked
+        run_backend_optimization();
 
         cv::destroyAllWindows();
         std::cout << "Processing complete.\n";

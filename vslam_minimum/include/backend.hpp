@@ -185,11 +185,6 @@ struct Sim3Edge
 class PoseGraph
 {
 public:
-    Sophus::Sim3d se3_to_sim3(const Sophus::SE3d& T, double scale = 1.0)
-    {
-        return Sophus::Sim3d(Sophus::RxSO3d(scale, T.rotationMatrix()), T.translation());
-    }
-
     // Sim3 tangent order: [upsilon(3), omega(3), sigma(1)]
     //                      translation, rotation, log_scale
     PoseGraph(double trans_weight = 10.0, double rot_weight = 100.0, double scale_weight = 10.0)
@@ -288,6 +283,10 @@ private:
     std::vector<int> kf_indices_;
     std::vector<Sim3Edge> edges_;      // ONE vector: sequential + loop
     Eigen::Matrix<double, 7, 7> odom_info_;
+    Sophus::Sim3d se3_to_sim3(const Sophus::SE3d& T, double scale = 1.0)
+    {
+        return Sophus::Sim3d(Sophus::RxSO3d(scale, T.rotationMatrix()), T.translation());
+    }
 };
 
 

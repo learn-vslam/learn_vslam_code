@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -77,7 +79,7 @@ public:
         std::vector<cv::Point2f>& pts1,
         std::vector<cv::Point2f>& pts2,
         std::vector<int>& pids,
-        cv::Mat& K)
+        const cv::Mat& K)
     {
         double fx = K.at<double>(0,0);
         double cx = K.at<double>(0,2);
@@ -127,7 +129,7 @@ public:
         const Eigen::Matrix4d& T_1w,
         const Eigen::Matrix4d& T_2w,
         std::vector<bool>& valid_mask,
-        cv::Mat& K)
+        const cv::Mat& K)
     {
         // build projection matrices: P = K @ inv(T_wc)[:3,:]
         Eigen::Matrix4d T_1w_inv = T_1w.inverse();
