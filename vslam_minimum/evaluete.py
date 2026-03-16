@@ -4,16 +4,19 @@
 import sys
 import os
 from pathlib import Path
+from dataclasses import dataclass
+import tyro
+import matplotlib.pyplot as plt
 
 # Add mono_vo_py to path
 mono_vo_py_path = Path(__file__).parent.parent / 'mono_vo_py'
 if not mono_vo_py_path.exists():
-    mono_vo_py_path = Path('/home/jeffrey/ws/mono_vo_py')
+    mono_vo_py_path = Path('/home/jeffrey/ws/learn_vslam_code/mono_vo_py')
 sys.path.insert(0, str(mono_vo_py_path))
 
 # Import from mono_vo_py
 sys.path.insert(0, str(mono_vo_py_path))
-from utils.pose_utils import compute_ate, compute_rpe
+from utils.pose_utils import compute_ate, compute_rpe, umeyama_alignment
 from mono_vo import Visualizer, CoordTransform
 from data_loaders.kitti_loader import KITTILoader
 import numpy as np
@@ -57,19 +60,22 @@ def load_ply(filepath):
     return np.array(points), np.array(colors)
 
 
+@dataclass
+class Args:
+    """Evaluation arguments"""
+    seq: str = '00'
+    data_root: str = f'/home/{os.environ.get("USER", "user")}/ws/datasets'
+    result_dir: str = './build/results/KITTI'
+
+
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seq', type=str, default='09')
-    parser.add_argument('--data_root', type=str, 
-                       default=f'/media/{os.environ.get("USER", "user")}/SeagateDrive/ws/datasets/')
-    parser.add_argument('--result_dir', type=str, default='./build/results/KITTI')
-    args = parser.parse_args()
+    args = tyro.cli(Args)
     
     # Paths
     result_dir = Path(args.result_dir) / args.seq
     traj_file = result_dir / 'traj_est.txt'
     traj_ba_file = result_dir / 'traj_est_ba.txt'
+    traj_pgo_file = result_dir / 'traj_est_pgo.txt'
     pcd_file = result_dir / 'pcd.ply'
     pcd_ba_file = result_dir / 'pcd_ba.ply'
     gt_file = Path(args.data_root) / 'kitti-odom/data_odometry_poses/dataset/poses' / f'{args.seq}.txt'
@@ -85,6 +91,13 @@ if __name__ == '__main__':
     else:
         print(f"BA trajectory not found: {traj_ba_file}, using before BA")
         est_poses_after = est_poses_before
+    
+    est_poses_pgo = None
+    if traj_pgo_file.exists():
+        print(f"Loading after PGO: {traj_pgo_file}")
+        est_poses_pgo = load_trajectory(traj_pgo_file)
+    else:
+        print(f"PGO trajectory not found: {traj_pgo_file}, skipping PGO evaluation")
     
 
     # Load GT poses if available
@@ -113,6 +126,11 @@ if __name__ == '__main__':
     for i, pose in enumerate(est_poses_after):
         est_poses_after_list.append((i, pose[1], pose[2], pose[3], pose[4], pose[5], pose[6], pose[7]))
     
+    est_poses_pgo_list = []
+    if est_poses_pgo is not None:
+        for i, pose in enumerate(est_poses_pgo):
+            est_poses_pgo_list.append((i, pose[1], pose[2], pose[3], pose[4], pose[5], pose[6], pose[7]))
+    
     # Evaluate before BA
     ate_trans_before, ate_rot_before = compute_ate(gt_poses_vec, est_poses_before_list)
     rpe_trans_before, rpe_rot_before = compute_rpe(gt_poses_vec, est_poses_before_list)
@@ -125,6 +143,43 @@ if __name__ == '__main__':
     print(f"\n[After BA]  ATE: {ate_trans_after:.4f} m, {ate_rot_after:.4f} deg")
     print(f"[After BA]  RPE: {rpe_trans_after:.4f} m, {rpe_rot_after:.4f} deg")
     
+    # Evaluate after PGO
+    if est_poses_pgo is not None and len(est_poses_pgo_list) > 0:
+        ate_trans_pgo, ate_rot_pgo = compute_ate(gt_poses_vec, est_poses_pgo_list)
+        rpe_trans_pgo, rpe_rot_pgo = compute_rpe(gt_poses_vec, est_poses_pgo_list)
+        print(f"\n[After PGO] ATE: {ate_trans_pgo:.4f} m, {ate_rot_pgo:.4f} deg")
+        print(f"[After PGO] RPE: {rpe_trans_pgo:.4f} m, {rpe_rot_pgo:.4f} deg")
+    
+    # ── Bird's eye view plot (XZ plane, KITTI convention) ──
+    # GT is in KITTI CV frame: x=right, y=down, z=forward
+    # Estimated is in ROS frame, but Umeyama aligns it to GT frame
+    gt_xyz = np.array([[p[1], p[2], p[3]] for p in gt_poses_vec])
+
+    def align_traj(est_list):
+        pr_xyz = np.array([[p[1], p[2], p[3]] for p in est_list])
+        s, R, t = umeyama_alignment(pr_xyz, gt_xyz[:len(pr_xyz)])
+        return (s * (R @ pr_xyz.T).T) + t
+
+    est_before_aligned = align_traj(est_poses_before_list)
+    est_pgo_aligned = align_traj(est_poses_pgo_list) if est_poses_pgo_list else None
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    # KITTI bird's eye: x (right) vs z (forward)
+    ax.plot(gt_xyz[:, 0], gt_xyz[:, 2], 'k-', linewidth=2, label='Ground Truth')
+    ax.plot(est_before_aligned[:, 0], est_before_aligned[:, 2], 'b-', linewidth=1, alpha=0.7, label='Before BA/PGO')
+    if est_pgo_aligned is not None:
+        ax.plot(est_pgo_aligned[:, 0], est_pgo_aligned[:, 2], 'r-', linewidth=1, alpha=0.7, label='After PGO')
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('z (m)')
+    ax.set_title(f'Bird\'s Eye View - KITTI Seq {args.seq}')
+    ax.legend()
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    plot_path = result_dir / 'traj_bev.png'
+    fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved bird's eye view plot to: {plot_path}")
+    plt.show()
+
     viz = Visualizer(EvalConfig())
     
     # Estimated poses (before BA)
@@ -148,6 +203,17 @@ if __name__ == '__main__':
         T_wc_ros[:3, :3] = R
         T_wc_ros[:3, 3] = t
         viz.add_cam_frame(T_wc_ros, "estimated_after_ba", i)
+    
+    # Optimized poses (after PGO)
+    if est_poses_pgo is not None:
+        for i, pose in enumerate(est_poses_pgo):
+            t = np.array([pose[1], pose[2], pose[3]])
+            q = np.array([pose[4], pose[5], pose[6], pose[7]])
+            R = Rotation.from_quat(q).as_matrix()
+            T_wc_ros = np.eye(4)
+            T_wc_ros[:3, :3] = R
+            T_wc_ros[:3, 3] = t
+            viz.add_cam_frame(T_wc_ros, "estimated_after_pgo", i)
     
     # Point cloud
     if pcd_file.exists():

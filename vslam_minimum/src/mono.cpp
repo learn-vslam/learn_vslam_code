@@ -17,24 +17,9 @@
 
 // other files
 #include "backend.hpp"
-#include "io.hpp"
+#include "utils.hpp"
 
 namespace fs = std::filesystem;
-
-
-struct CoordTransform 
-{
-    static Eigen::Matrix4d T_cv_to_ros() 
-    {
-        Eigen::Matrix4d T;
-        T <<  0,  0,  1,  0,
-             -1,  0,  0,  0,
-              0, -1,  0,  0,
-              0,  0,  0,  1;
-        return T;
-    }
-};
-
 
 class MonoVO 
 {
@@ -68,6 +53,11 @@ public:
     std::string out_ply_file;
     std::string out_ply_ba_file;  // Optimized after BA
 
+    // online pose graph optimization
+    PoseGraph pose_graph;
+    LoopDetector loop_detector;
+    SaveIO save_io;
+
     MonoVO(const Config& cfg) : config(cfg) 
     {
         KITTILoader loader(config);
@@ -86,11 +76,12 @@ public:
         // truncate pose files
         std::ofstream(out_pose_file, std::ios::trunc).close();
         std::ofstream(out_pose_ba_file, std::ios::trunc).close();
-        std::ofstream(out_pose_ba_file, std::ios::trunc).close();
 
-        std::cout << "MonoVO initialized\n";
-        std::cout << "K:\n" << K << "\n";
-        std::cout << "frames: " << num_frames << ", gt: " << gt_pose.size() << "\n";
+        std::cout << "MonoVO initialized " << std::endl;
+        std::cout << "num of frames: " << num_frames << std::endl;
+        
+        // Initialize loop detector
+        loop_detector = LoopDetector(K);
     }
 
 
@@ -106,7 +97,7 @@ public:
 
 
     void track_features(
-        const cv::Mat& prev_gray, const cv::Mat& curr_gray,
+        const cv::Mat& prev_gray, const cv::Mat& curr_img_gray,
         std::vector<cv::Point2f>& prev_pts, std::vector<cv::Point2f>& curr_pts,
         std::vector<int>& prev_pids, std::vector<int>& curr_pids)
     {
@@ -119,12 +110,12 @@ public:
 
         std::vector<uchar> status;
         std::vector<float> err;
-        cv::calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, curr_pts, status, err);
+        cv::calcOpticalFlowPyrLK(prev_gray, curr_img_gray, prev_pts, curr_pts, status, err);
 
         // Bidirectional check
         std::vector<cv::Point2f> back_pts;
         std::vector<uchar> status_back;
-        cv::calcOpticalFlowPyrLK(curr_gray, prev_gray, curr_pts, back_pts, status_back, err);
+        cv::calcOpticalFlowPyrLK(curr_img_gray, prev_gray, curr_pts, back_pts, status_back, err);
 
         std::vector<cv::Point2f> good_prev, good_curr;
         std::vector<int> good_pids;
@@ -268,7 +259,8 @@ public:
         int M = (int)pcd.cols();
         Eigen::Matrix4d T_cv_to_ros = CoordTransform::T_cv_to_ros();
 
-        for (int i = 0; i < M; i++) {
+        for (int i = 0; i < M; i++) 
+        {
             // Transform from CV world frame to ROS world frame
             Eigen::Vector4d X_cv_world;
             X_cv_world << pcd(0,i), pcd(1,i), pcd(2,i), 1.0;
@@ -304,94 +296,59 @@ public:
         return par[par.size()/2] >= min_parallax;
     }
 
-
-    void save_output_pose(int idx, const Eigen::Matrix4d& T_wc, const std::string& filename) 
-    {
-        Eigen::Matrix4d T_wc_ros = CoordTransform::T_cv_to_ros() * T_wc * Eigen::Matrix4d::Identity().transpose();
-        Eigen::Vector3d t = T_wc_ros.block<3,1>(0,3);
-        Eigen::Quaterniond q(T_wc_ros.block<3,3>(0,0));
-        std::ofstream f(filename, std::ios::app);
-        f << idx << " "
-          << t.x() << " " << t.y() << " " << t.z() << " "
-          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
-    }
-
-
-    void save_ply(const std::string& path,
-                  const std::vector<std::array<double,3>>& pts,
-                  const std::vector<std::array<uint8_t,3>>& colors)
-    {
-        std::ofstream f(path);
-        f << "ply\nformat ascii 1.0\n"
-          << "element vertex " << pts.size() << "\n"
-          << "property float x\nproperty float y\nproperty float z\n"
-          << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-          << "end_header\n";
-        for (size_t i = 0; i < pts.size(); i++)
-            f << pts[i][0] << " " << pts[i][1] << " " << pts[i][2] << " "
-              << (int)colors[i][0] << " " << (int)colors[i][1] << " " << (int)colors[i][2] << "\n";
-    }
-
-
     void run() 
     {
         Eigen::Matrix4d prev_T_wc = Eigen::Matrix4d::Identity();
-
+        bool is_kf;
         // for (int frame_idx = 0; frame_idx < num_frames; frame_idx++)
         for (int frame_idx = 0; frame_idx < 500; frame_idx++)
         {
             cv::Mat curr_img = cv::imread(img_files[frame_idx], cv::IMREAD_COLOR);
-            if (curr_img.empty()) {
-                std::cerr << "bad read: " << img_files[frame_idx] << "\n";
-                continue;
-            }
-
+            cv::Mat curr_img_gray;
+            cv::cvtColor(curr_img, curr_img_gray, cv::COLOR_BGR2GRAY);
             Eigen::Matrix4d curr_T_wc;
-            bool is_kf = false;
-            std::vector<cv::Point2f> curr_kps; // for keypoint display
+            is_kf = false;
 
             if (frame_idx == 0) 
             {
                 curr_T_wc = Eigen::Matrix4d::Identity();
                 is_kf = true;
                 
-                // Detect initial features
-                cv::Mat gray;
-                cv::cvtColor(curr_img, gray, cv::COLOR_BGR2GRAY);
-                detect_features(gray, prev_tracked_pts);
+                // detect initial features
+                detect_features(curr_img_gray, prev_tracked_pts);
                 prev_tracked_pids.assign(prev_tracked_pts.size(), -1);
-                prev_img_gray = gray;
-                curr_kps = prev_tracked_pts;
+                prev_img_gray = curr_img_gray;
 
-                // Add frame 0 as first keyframe (even without triangulation)
+                // Add frame 0 as first keyframe
                 kf_poses.push_back(curr_T_wc);
                 kf_frame_indices.push_back(0);
                 kf_keypoints.push_back(Eigen::MatrixX2d(0, 2));  // Empty keypoints for frame 0
                 kf_point_ids.push_back(std::vector<int>());  // Empty point IDs for frame 0
+                
+                // add frame 0, the 1st keyframe to pose graph
+                pose_graph.add_keyframe(0, curr_T_wc, Sophus::SE3d());
+                loop_detector.add_keyframe(curr_img_gray); 
             } 
             else 
             {
-                cv::Mat curr_gray;
-                cv::cvtColor(curr_img, curr_gray, cv::COLOR_BGR2GRAY);
-
                 // Track features with optical flow
                 std::vector<cv::Point2f> prev_pts = prev_tracked_pts;
                 std::vector<cv::Point2f> curr_pts;
                 std::vector<int> prev_pids = prev_tracked_pids;
                 std::vector<int> curr_pids;
-                track_features(prev_img_gray, curr_gray, prev_pts, curr_pts, prev_pids, curr_pids);
+                track_features(prev_img_gray, curr_img_gray, prev_pts, curr_pts, prev_pids, curr_pids);
 
-                if (prev_pts.size() < 10) {
+                if (prev_pts.size() < 10) 
+                {
                     std::cerr << "frame " << frame_idx << ": too few tracks\n";
                     curr_T_wc = prev_T_wc;
                     // Re-detect
-                    detect_features(curr_gray, prev_tracked_pts);
+                    detect_features(curr_img_gray, prev_tracked_pts);
                     prev_tracked_pids.assign(prev_tracked_pts.size(), -1);
-                    prev_img_gray = curr_gray;
+                    prev_img_gray = curr_img_gray;
                     continue;
                 }
 
-                // compute_pose filters pts and pids to inliers in-place
                 Eigen::Matrix4d T_prev_curr = compute_pose(prev_pts, curr_pts, curr_pids);
 
                 curr_T_wc = prev_T_wc * T_prev_curr;
@@ -441,7 +398,8 @@ public:
                     }
 
                     // Append new observations to previous keyframe
-                    if (!prev_kf_new_pids.empty() && kf_keypoints.size() > 0) {
+                    if (!prev_kf_new_pids.empty() && kf_keypoints.size() > 0) 
+                    {
                         size_t prev_kf = kf_keypoints.size() - 1;
                         
                         // Append to kf_point_ids
@@ -472,12 +430,11 @@ public:
                         }
                     }
 
+                    // Always add to BA arrays to stay in sync with pose_graph / loop_detector
+                    kf_poses.push_back(curr_T_wc);
+                    kf_frame_indices.push_back(frame_idx);
                     if (!kps_valid.empty())
                     {
-                        curr_kps = kps_valid;
-                        
-                        kf_poses.push_back(curr_T_wc);
-                        kf_frame_indices.push_back(frame_idx);
                         Eigen::MatrixX2d kp_mat(kps_valid.size(), 2);
                         for (size_t i = 0; i < kps_valid.size(); i++) {
                             kp_mat(i, 0) = kps_valid[i].x;
@@ -486,16 +443,44 @@ public:
                         kf_keypoints.push_back(kp_mat);
                         kf_point_ids.push_back(point_ids);
                     }
-                } 
-                else
-                {
-                    curr_kps = curr_pts;
-                }
+                    else
+                    {
+                        kf_keypoints.push_back(Eigen::MatrixX2d(0, 2));
+                        kf_point_ids.push_back(std::vector<int>());
+                    }
 
+                    Sophus::SE3d T_ij_measured(T_prev_curr);
+                    pose_graph.add_keyframe(frame_idx, curr_T_wc, T_ij_measured);
+
+                    // Loop closure detection
+                    loop_detector.add_keyframe(curr_img_gray);
+                    auto [loop_kf, T_loop] = loop_detector.detect();
+                    if (loop_kf >= 0)
+                    {
+                        int curr_pg_idx = pose_graph.size() - 1;
+                        std::cout << "[Loop] Loop detection found! frame " << frame_idx 
+                                  << " <-> frame " << kf_frame_indices[loop_kf] 
+                                  << " (pg " << loop_kf << " <-> " << curr_pg_idx << ")\n";
+
+                        // Simple loop closure: use recoverPose rotation
+                        Eigen::Matrix4d T_meas = Eigen::Matrix4d::Identity();
+                        T_meas.block<3,3>(0,0) = T_loop.rotationMatrix();
+                        Sophus::SE3d T_loop_edge(T_meas);
+
+                        Eigen::Matrix<double, 7, 7> loop_info = Eigen::Matrix<double, 7, 7>::Zero();
+                        loop_info.block<3,3>(0,0) = 50.0 * Eigen::Matrix3d::Identity();  // translation
+                        loop_info.block<3,3>(3,3) = 5.0 * Eigen::Matrix3d::Identity();   // rotation
+                        loop_info(6,6) = 10.0;                                            // scale
+
+                        pose_graph.add_loop_edge(loop_kf, curr_pg_idx, T_loop_edge, loop_info);
+                    }
+                }
+                
                 // Replenish lost tracks
-                if (curr_pts.size() < 1500) {
+                if (curr_pts.size() < 1500) 
+                {
                     std::vector<cv::Point2f> new_pts;
-                    detect_features(curr_gray, new_pts);
+                    detect_features(curr_img_gray, new_pts);
                     for (auto& np : new_pts) {
                         bool too_close = false;
                         for (auto& ep : curr_pts) {
@@ -510,17 +495,17 @@ public:
 
                 prev_tracked_pts = curr_pts;
                 prev_tracked_pids = curr_pids;
-                prev_img_gray = curr_gray;
-
-                // show keypoints
-                std::vector<cv::KeyPoint> kps_draw;
-                for (auto& p : curr_kps)
-                    kps_draw.push_back(cv::KeyPoint(p, 1.f));
-                cv::Mat img_kp;
-                cv::drawKeypoints(curr_img, kps_draw, img_kp, cv::Scalar(0, 255, 0));
-                cv::imshow("keypoints from current image", img_kp);
-                cv::waitKey(1);
+                prev_img_gray = curr_img_gray;
             }
+
+            // show keypoints
+            std::vector<cv::KeyPoint> kps_draw;
+            for (auto& p : prev_tracked_pts)
+                kps_draw.push_back(cv::KeyPoint(p, 1.f));
+            cv::Mat img_kp;
+            cv::drawKeypoints(curr_img, kps_draw, img_kp, cv::Scalar(0, 255, 0));
+            cv::imshow("keypoints from current image", img_kp);
+            cv::waitKey(1);
             
             prev_T_wc = curr_T_wc;
         }
@@ -551,14 +536,16 @@ public:
         run_ba(kf_poses, kf_keypoints, kf_point_ids, points_3d, K_eigen);
             
         // Save original point cloud before updating with optimized points
-        if (!pcd_all.empty()) {
-            save_ply(out_ply_file, pcd_all, pcd_colors_all);
+        if (!pcd_all.empty()) 
+        {
+            save_io.save_ply(out_ply_file, pcd_all, pcd_colors_all);
             std::cout << "[BA] Saved " << pcd_all.size() << " original points → " << out_ply_file << "\n";
         }
         
         // Update pcd_all with optimized points (convert CV world to ROS world)
         Eigen::Matrix4d T_cv_to_ros_pcd = CoordTransform::T_cv_to_ros();
-        for (size_t pid = 0; pid < points_3d.size(); pid++) {
+        for (size_t pid = 0; pid < points_3d.size(); pid++) 
+        {
             auto it = point_id_to_pcd_idx.find(static_cast<int>(pid));
             if (it != point_id_to_pcd_idx.end()) {
                 size_t pcd_idx = it->second;
@@ -576,20 +563,39 @@ public:
         std::ofstream(out_pose_ba_file, std::ios::trunc).close();
 
         // Save output pose before and after BA
-        for (size_t i = 0; i < kf_poses.size(); i++) {
-            save_output_pose(kf_frame_indices[i], kf_poses_before[i], out_pose_file);
-            save_output_pose(kf_frame_indices[i], kf_poses[i], out_pose_ba_file);
+        for (size_t i = 0; i < kf_poses.size(); i++) 
+        {
+            save_io.save_output_pose(kf_frame_indices[i], kf_poses_before[i], out_pose_file);
+            save_io.save_output_pose(kf_frame_indices[i], kf_poses[i], out_pose_ba_file);
         }
         
         // Save optimized point cloud
         std::cout << "[BA] About to save optimized point cloud to: " << out_ply_ba_file << "\n";
         std::cout << "[BA] pcd_all.size() = " << pcd_all.size() << "\n";
-        if (!pcd_all.empty()) {
-            save_ply(out_ply_ba_file, pcd_all, pcd_colors_all);
+        if (!pcd_all.empty()) 
+        {
+            save_io.save_ply(out_ply_ba_file, pcd_all, pcd_colors_all);
             std::cout << "[BA] Saved " << pcd_all.size() << " optimized points → " << out_ply_ba_file << "\n";
-        } else {
+        } 
+        else 
+        {
             std::cerr << "[BA] ERROR: pcd_all is empty, cannot save optimized point cloud!\n";
         }
+
+        // After BA saving, run final PGO optimization and save
+        std::cout << "\n[PGO] Running final pose graph optimization with "
+                  << pose_graph.size() << " keyframes and " << pose_graph.num_edges() << " edges\n";
+        pose_graph.run_sim3_pgo(pose_graph.get_poses(), pose_graph.get_edges());
+        
+        std::string out_pose_pgo_file = config.result_dir + "/traj_est_pgo.txt";
+        std::ofstream(out_pose_pgo_file, std::ios::trunc).close();
+        const auto& pgo_poses = pose_graph.get_poses();
+        const auto& pgo_indices = pose_graph.get_kf_indices();
+        for (size_t i = 0; i < pgo_poses.size(); i++) 
+        {
+            save_io.save_output_pose(pgo_indices[i], pgo_poses[i], out_pose_pgo_file);
+        }
+        std::cout << "[PGO] Saved " << pgo_poses.size() << " optimized poses → " << out_pose_pgo_file << "\n";
         
         cv::destroyAllWindows();
         

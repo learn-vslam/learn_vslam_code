@@ -11,9 +11,24 @@
 namespace fs = std::filesystem;
 
 
+class CoordTransform 
+{
+public:
+    static Eigen::Matrix4d T_cv_to_ros() 
+    {
+        Eigen::Matrix4d T;
+        T <<  0,  0,  1,  0,
+             -1,  0,  0,  0,
+              0, -1,  0,  0,
+              0,  0,  0,  1;
+        return T;
+    }
+};
+
+
 class Config {
 public:
-    std::string data_root  = "/media/" + std::string(getenv("USER")) + "/SeagateDrive/ws/datasets/";
+    std::string data_root  = "/home/" + std::string(getenv("USER")) + "/ws/datasets";
     std::string dataset_type = "KITTI";
     bool   load_gt_pose    = true;
     std::string seq        = "09";
@@ -28,7 +43,8 @@ public:
 };
 
 
-class KITTILoader {
+class KITTILoader 
+{
 public:
     Config cfg;
 
@@ -90,5 +106,37 @@ public:
             poses.push_back(T);
         }
         return poses;
+    }
+};
+
+
+class SaveIO
+{
+public:
+    void save_output_pose(int idx, const Eigen::Matrix4d& T_wc, const std::string& filename) 
+    {
+        Eigen::Matrix4d T_wc_ros = CoordTransform::T_cv_to_ros() * T_wc * Eigen::Matrix4d::Identity().transpose();
+        Eigen::Vector3d t = T_wc_ros.block<3,1>(0,3);
+        Eigen::Quaterniond q(T_wc_ros.block<3,3>(0,0));
+        std::ofstream f(filename, std::ios::app);
+        f << idx << " "
+        << t.x() << " " << t.y() << " " << t.z() << " "
+        << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+
+
+    void save_ply(const std::string& path,
+                const std::vector<std::array<double,3>>& pts,
+                const std::vector<std::array<uint8_t,3>>& colors)
+    {
+        std::ofstream f(path);
+        f << "ply\nformat ascii 1.0\n"
+        << "element vertex " << pts.size() << "\n"
+        << "property float x\nproperty float y\nproperty float z\n"
+        << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        << "end_header\n";
+        for (size_t i = 0; i < pts.size(); i++)
+            f << pts[i][0] << " " << pts[i][1] << " " << pts[i][2] << " "
+            << (int)colors[i][0] << " " << (int)colors[i][1] << " " << (int)colors[i][2] << "\n";
     }
 };

@@ -28,11 +28,48 @@ def _to_mat(tx, ty, tz, qx, qy, qz, qw):
     return T
 
 
-def compute_ate(gt, pred):
-    """ATE: absolute translation and rotation error (no alignment).
+def umeyama_alignment(src, dst):
+    """Sim3 alignment (Umeyama 1991): finds s, R, t such that dst ≈ s*R*src + t.
+    
+    Args:
+        src: (N, 3) source points
+        dst: (N, 3) destination points
+    Returns:
+        s, R, t - scale, rotation (3x3), translation (3,)
+    """
+    assert src.shape == dst.shape
+    n, d = src.shape
+
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    var_src = np.sum(src_c ** 2) / n
+
+    H = dst_c.T @ src_c / n
+    U, S_vals, Vt = np.linalg.svd(H)
+
+    D = np.eye(d)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        D[d - 1, d - 1] = -1
+
+    R = U @ D @ Vt
+    s = np.trace(np.diag(S_vals) @ D) / var_src
+    t = mu_dst - s * R @ mu_src
+
+    return s, R, t
+
+
+def compute_ate(gt, pred, align=True):
+    """ATE: absolute translation and rotation error.
+    
+    When align=True, performs Sim3 alignment (Umeyama) before computing error.
+    This is essential for monocular VO where scale is unknown.
     
     Args:
         gt, pred: list of (frame_idx, tx, ty, tz, qx, qy, qz, qw)
+        align: if True, do Sim3 alignment first
     Returns:
         (ate_trans, ate_rot) - RMSE in meters and degrees
     """
@@ -45,6 +82,10 @@ def compute_ate(gt, pred):
 
     gt_xyz = np.array([gt_dict[i][1:4] for i in common])
     pr_xyz = np.array([pr_dict[i][1:4] for i in common])
+
+    if align and len(common) >= 3:
+        s, R_align, t_align = umeyama_alignment(pr_xyz, gt_xyz)
+        pr_xyz = (s * (R_align @ pr_xyz.T).T) + t_align
 
     trans_errors = np.linalg.norm(pr_xyz - gt_xyz, axis=1)
 

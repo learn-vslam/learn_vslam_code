@@ -9,7 +9,7 @@ find_package(Eigen3 REQUIRED)
 find_package(Ceres REQUIRED)
 find_package(Sophus REQUIRED)
 
-add_executable(mono_vo src/mono_vo.cpp)
+add_executable(mono_vo src/mono.cpp)
 target_include_directories(mono_vo PUBLIC
   ${OpenCV_INCLUDE_DIRS}
   include
